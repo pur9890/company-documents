@@ -32,7 +32,10 @@ KINDS = {
     "concall":      "Concall Transcripts",
     "presentation": "Investor Presentations",
     "rating":       "Credit Ratings",
+    "quarterly":    "Quarterly Results",
 }
+MONTHS = {3: "Mar", 6: "Jun", 9: "Sep", 12: "Dec"}
+OLDEST_QUARTER_YEAR = 2010   # older quarters are tried back to this year
 
 app = Flask(__name__)
 
@@ -133,6 +136,32 @@ def get_documents(company_url):
                 elif lab == "ppt":
                     add("presentation", a["href"], f"Investor presentation {period}", period, y)
 
+    # Quarterly results (Screener's "Raw PDF" row). Screener only shows the
+    # last ~13 quarters, but the same link pattern works for older ones, so
+    # we also list older quarters back to OLDEST_QUARTER_YEAR.
+    qlinks = soup.find_all("a", href=re.compile(r"/company/source/quarter/\d+/\d+/\d{4}"))
+    shown = set()
+    cid = None
+    for a in qlinks:
+        m = re.search(r"/company/source/quarter/(\d+)/(\d+)/(\d{4})", a["href"])
+        cid, mo, yr = m.group(1), int(m.group(2)), int(m.group(3))
+        shown.add((yr, mo))
+    if cid:
+        latest = max(shown)
+        yr, mo = latest
+        while yr >= OLDEST_QUARTER_YEAR:
+            if mo in MONTHS:
+                fy = yr if mo <= 3 else yr + 1
+                qn = {6: 1, 9: 2, 12: 3, 3: 4}[mo]
+                period = f"Q{qn} FY{str(fy)[2:]} ({MONTHS[mo]} {yr})"
+                add("quarterly", f"/company/source/quarter/{cid}/{mo}/{yr}/",
+                    f"Quarterly result Q{qn} FY{str(fy)[2:]}", period, yr,
+                    "" if (yr, mo) in shown else "older")
+            mo -= 3
+            if mo <= 0:
+                mo += 12
+                yr -= 1
+
     return {"name": name, "code": code, "url": urljoin(BASE, company_url), "items": items}
 
 
@@ -141,7 +170,7 @@ def fetch_file(url):
     global _nse_warm
     host = urlparse(url).netloc.lower()
     headers = {"Accept": "application/pdf,text/html,*/*"}
-    if "bseindia" in host:
+    if "bseindia" in host or "screener" in host:
         headers["Referer"] = "https://www.bseindia.com/"
     if "nseindia" in host:
         headers["Referer"] = "https://www.nseindia.com/"
@@ -172,11 +201,12 @@ def safe(s):
 
 def base_name(code, item):
     tag = {"annual": "AnnualReport", "concall": "ConcallTranscript",
-           "presentation": "InvestorPPT", "rating": "CreditRating"}[item["kind"]]
+           "presentation": "InvestorPPT", "rating": "CreditRating",
+           "quarterly": "QuarterlyResult"}[item["kind"]]
     parts = [code, tag]
     if item["kind"] == "rating" and item.get("source"):
         parts.append(item["source"])
-    parts.append(item.get("period") or "")
+    parts.append((item.get("period") or "").replace("(", "").replace(")", ""))
     return safe("_".join(p for p in parts if p))
 
 
@@ -192,6 +222,8 @@ def run_zip_job(job_id, code, items):
     def work(it):
         try:
             content, ctype = fetch_file(it["url"])
+            if it["kind"] == "quarterly" and content[:5] != b"%PDF-":
+                raise ValueError("not available for this quarter")
             return it, content, ctype, None
         except Exception as e:  # noqa: BLE001
             return it, None, None, str(e)
@@ -254,6 +286,7 @@ def api_docs():
 def api_file():
     url = request.args.get("url", "")
     name = request.args.get("name", "document")
+    kind = request.args.get("kind", "")
     if urlparse(url).scheme not in ("http", "https"):
         abort(400)
     try:
@@ -261,6 +294,9 @@ def api_file():
     except Exception as e:  # noqa: BLE001
         return Response(f"Download failed: {e}\n\nOpen the original instead: {url}",
                         status=502, mimetype="text/plain")
+    if kind == "quarterly" and content[:5] != b"%PDF-":
+        return Response("This quarter's result PDF is not available on Screener.",
+                        status=404, mimetype="text/plain")
     ext = extension(url, ctype, content)
     fname = safe(name) + ext
     mime = "application/pdf" if ext == ".pdf" else (ctype or "application/octet-stream")
@@ -348,7 +384,7 @@ h1{font-size:clamp(1.9rem,5vw,3rem);line-height:1.05;letter-spacing:-.03em;margi
 <div id="out"><div class="empty">Pick a company from the suggestions. You'll then choose which documents you want and download them one by one or all together as a ZIP.</div></div>
 </div>
 <script>
-const KINDS={annual:"Annual Reports",concall:"Concall Transcripts",presentation:"Investor Presentations",rating:"Credit Ratings"};
+const KINDS={annual:"Annual Reports",concall:"Concall Transcripts",presentation:"Investor Presentations",rating:"Credit Ratings",quarterly:"Quarterly Results"};
 const $=s=>document.querySelector(s);
 let docs=null, sel=-1, list=[], timer;
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -388,8 +424,8 @@ function chosen(){
   const from=+($("#from")?.value||0);
   return docs.items.filter(it=>kinds.includes(it.kind)&&(!from||!it.year||it.year>=from));
 }
-function fname(it){const tag={annual:"AnnualReport",concall:"ConcallTranscript",presentation:"InvestorPPT",rating:"CreditRating"}[it.kind];
-  return [docs.code,tag,it.kind==="rating"?it.source:"",it.period].filter(Boolean).join("_");}
+function fname(it){const tag={annual:"AnnualReport",concall:"ConcallTranscript",presentation:"InvestorPPT",rating:"CreditRating",quarterly:"QuarterlyResult"}[it.kind];
+  return [docs.code,tag,it.kind==="rating"?it.source:"",String(it.period).replace(/[()]/g,"")].filter(Boolean).join("_");}
 
 function render(){
   const counts={};docs.items.forEach(i=>counts[i.kind]=(counts[i.kind]||0)+1);
@@ -410,9 +446,9 @@ function drawGroups(){
   $("#groups").innerHTML=Object.entries(KINDS).map(([k,v])=>{
     const rows=items.filter(i=>i.kind===k);if(!rows.length)return"";
     return `<section class="group"><h3>${v}</h3>${rows.map(it=>`
-      <div class="row"><span class="t">${esc(it.label)}${it.source&&it.kind!=="rating"?`<span class="s">from ${esc(it.source)}</span>`:""}${it.kind==="rating"&&it.period?`<span class="s">${esc(it.period)}</span>`:""}</span>
+      <div class="row"><span class="t">${esc(it.label)}${it.kind==="quarterly"?`<span class="s">${esc(it.period.replace(/^.*\(|\)$/g,""))}${it.source==="older"?" · older, if available":""}</span>`:""}${it.source&&it.kind!=="rating"&&it.kind!=="quarterly"?`<span class="s">from ${esc(it.source)}</span>`:""}${it.kind==="rating"&&it.period?`<span class="s">${esc(it.period)}</span>`:""}</span>
       <a href="${esc(it.url)}" target="_blank" rel="noopener">Open</a>
-      <a class="dl" href="/api/file?url=${encodeURIComponent(it.url)}&name=${encodeURIComponent(fname(it))}">Download</a></div>`).join("")}</section>`;}).join("")
+      <a class="dl" href="/api/file?url=${encodeURIComponent(it.url)}&name=${encodeURIComponent(fname(it))}&kind=${it.kind}">Download</a></div>`).join("")}</section>`;}).join("")
     || `<div class="empty">No documents match these filters.</div>`;
 }
 async function zipAll(){
